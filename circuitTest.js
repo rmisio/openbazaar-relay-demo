@@ -13,11 +13,9 @@ const request = require("request");
 const PeerId = require('peer-id');
 const IPFS = require('ipfs');
 const PeerInfo = require('peer-info');
-const pull = require('pull-stream')
-const libp2p = require('libp2p');
-
-localStorage.debug = '*';
-
+const pull = require('pull-stream');
+const Pushable = require('pull-pushable');
+const p = Pushable();
 
 var identity_key = "";
 var relay_server = "wss://webchat.ob1.io:8080";
@@ -28,68 +26,91 @@ var ephem_keypair = "";
 var my_peer_id = "";
 var root = protobuf.Root.fromJSON(jsonDescriptor);
 
+window.root = root;
+
 var ws = "";
 
-const options = {
-      EXPERIMENTAL: {
-        pubsub: true
-      },
-      relay: {
-        "enabled": true,
-        "hop": {
-          "enabled": true
-        }
-      },
-      repo: 'ipfs/ipfs-node1'
-    }
+const oldLog = console.log;
 
-    node = new IPFS(options)
+console.log = (...args) => {
+  if (args[0] === 'hero') return oldLog(...args.slice(1));
+}
+
+const log = (...args) => {
+  console.log('hero', ...args);
+}
+
+let node;
+
+const init = (name = '', cb) => {
+  const options = {
+    EXPERIMENTAL: {
+      pubsub: true
+    },
+    relay: {
+      "enabled": true,
+      "hop": {
+        "enabled": true
+      }
+    },
+    repo: `./ipfs/ipfs-node${name ? `-${name}` : ''}`,
+  };
+
+  node = new IPFS(options);
 
   node.on('ready', () => {
-
-    node.id(function (err, identity) {
-      if (err) {
-        throw err
-      }
-      console.log(identity)
-    })
-
     document.getElementById('peerid').innerHTML = node._peerInfo.id._idB58String;
 
     my_peer_id = node._peerInfo.id._idB58String;
 
-    //peer = "/ip4/138.68.5.113/tcp/9005/ws/ipfs/QmPPg2qeF3n2KvTRXRZLaTwHCw8JxzF4uZK93RfMoDvf2o"; // Push Node 1
     peer = "/dns4/webchat.ob1.io/tcp/9999/wss/ipfs/QmVc37Xishzc8R3ZXn1p4Mm27nkSWhGSVdRr9Zi3NPRq8V"; // Webchat Relay Circuit Hop
+    
     node.swarm.connect(peer, (err) => {
       if (err) {
         return console.error(err)
       }
-      console.log("Connected to peer: ", peer);
 
-      function logger (read) {
+      log(`Connected to curcuit relay peer: `, peer);
 
-        read(null, function next(end, data) {
-          if(end === true || data == "") return
-          if(end) throw end
+      if (typeof cb === 'function') cb();
+    });
 
-          console.log("Received custom protocol data from OB desktop node:", data, end)
+    // handle incoming messages
+    // node._libp2pNode.handle('dabears/1', (protocol, conn) => {
+    //   log('pro con');
+    //   window.pro = protocol;
+    //   window.con = conn;
+    //   pull(conn, conn);
+    // });
 
-          read(null, next)
-        })
-      }
+    // handle incoming messages
+    node._libp2pNode.handle('dabears/1', (protocol, conn) => {
+      const Message = root.lookupType('Message');
+      const Chat = root.lookupType('Chat');
 
-      node._libp2pNode.handle('/openbazaar/app/1.0.0', (protocol, conn) => {
+      pull(
+        conn,
+        // pull.map((data) => {
+        //   return data.toString('utf8').replace('\n', '')
+        // }),
+        pull.collect((...args) => {
+          const [err, data] = args;
+          if (err) { throw err };
+          log('received echo:', data.toString());
+          window.echo = args;
 
-        console.log('Handling /openbazaar/app/1.0.0 protocol', protocol, conn)
-        pull(
-          conn,
-          pull.map((v) => v.toString()),
-          logger
-        )
-      });
+          const decodedMsg = Message.decode(data[0]);
+          log('decoded message aroo');
+          window.aroo = decodedMsg;
 
-    })
-  })
+          const decodedChatMsg = Chat.decode(decodedMsg.payload.value);
+          log('decode chat message pickle');
+          window.pickle = decodedChatMsg;
+        }),
+      );
+    });
+  });
+};
 
 function getChatPayload(message) {
   var subject = ""; // Empty subject for chat message
@@ -113,15 +134,32 @@ function getChatPayload(message) {
   return payload;
 }
 
+const sendMessageForm = document.getElementById('sendMessageForm');
+
+sendMessageForm.addEventListener(
+  'submit',
+  (e, ...args) => {
+    e.preventDefault();
+
+    const peerID = sendMessageForm.peerID.value;
+    const message = sendMessageForm.message.value;
+
+    if (!node) init(sendMessageForm.name.value,
+      () => sendMessage(peerID, message));
+    else sendMessage(peerID, message);
+  },
+  false
+);
+
 /***************
 /* Call these methods from the browser
 ****************/
 
 window.generatePeerID = (cb) => {
   if(!mnemonic) {
-    console.log("No mnemonic set...");
+    log("No mnemonic set...");
     mnemonic = bip39.generateMnemonic();
-    console.log("Generated mnemonic:", mnemonic);
+    log("Generated mnemonic:", mnemonic);
   }
   var bip39seed = bip39.mnemonicToSeed(mnemonic, 'Secret Passphrase');
   var hmac = sha256.hmac.create("OpenBazaar seed");
@@ -129,7 +167,7 @@ window.generatePeerID = (cb) => {
   var seed = new Uint8Array(hmac.array());
   crypto2.keys.generateKeyPairFromSeed('ed25519', seed, (err, keypair)=>{
     var peerid = PeerId.createFromPubKey(crypto2.keys.marshalPublicKey(keypair.public), (err, key)=>{
-      console.log("Peer ID:", key._idB58String);
+      log("Peer ID:", key._idB58String);
       my_peer_id = key._idB58String;
       cb({
         "mnemonic": mnemonic,
@@ -148,28 +186,28 @@ window.sendMessage = (peerid, message) => {
     if (err) {
       return console.error("Error", err)
     }
-    console.log("Connected to peer:", peer);
+    log("Connected to peer:", peer);
 
-    node.swarm.peers((err, peerInfos) => {
-      if (err) {
-        throw err
-      }
-      console.log("PEER INFO", peerInfos)
-    });
+    // node.swarm.peers((err, peerInfos) => {
+    //   if (err) {
+    //     throw err
+    //   }
+    //   log("PEER INFO", peerInfos)
+    // });
 
 
-    // Send message to desktop node
-    node._libp2pNode.dialProtocol(peer, '/openbazaar/app/1.0.0', (err, conn) => {
+    // Send message to other node
+    node._libp2pNode.dialProtocol(peer, 'dabears/1', (err, conn) => {
       if (err) { throw err }
 
-      console.log('Web Node to Desktop Node on: ', conn)
+      log('Web Node to Desktop Node on: ', conn)
 
       var Chat = root.lookupType("Chat");
       var payload = getChatPayload(message);
-      console.log("Chat Payload:", payload);
+      log("Chat Payload:", payload);
 
-      if(Chat.verify(payload)) {
-        console.log("Problem verifying Chat protobuf payload");
+      if (Chat.verify(payload)) {
+        log("Problem verifying Chat protobuf payload");
       }
       var chatmessage = Chat.create(payload);
       var serializedChat = Chat.encode(chatmessage).finish();
@@ -182,28 +220,33 @@ window.sendMessage = (peerid, message) => {
           value: serializedChat
         }
       };
-      console.log("Message Payload:", message_payload);
+      log("Message Payload filly:", message_payload);
+      window.filly = message_payload;
 
-      if(Message.verify(message_payload)) {
-        console.log("Problem verifying Message protobuf payload");
+      if (Message.verify(message_payload)) {
+        log("Problem verifying Message protobuf payload");
       }
       var messageMessage = Message.create(message_payload);
       var serializedMessage = Message.encode(messageMessage).finish();
+      log('encoded payload: ', serializedMessage);
 
-      function sink (read) {
-        console.log(this)
+      function sink(read) {
+        // console.log(this)
         read(null, function next (err, data) {
           if(err) return console.log(err)
-          console.log("MY DATA",data)
+          log('MY DATA', data)
           read(null, next)
         })
       }
 
       pull(
         pull.once(serializedMessage),
-        conn
+        conn,
+        pull.collect((err, data) => {
+          if (err) { throw err }
+          // log('received echo:', data.toString())
+        }),
       )
-
     })
   })
 
